@@ -1,13 +1,19 @@
 from __future__ import annotations
-from contextlib import nullcontext
 
 import torch
-from torch import nn, cat, arange, tensor
+from torch import nn, stack, cat, arange, tensor
 import torch.nn.functional as F
 from torch.nn import Module, ModuleList
 
 from einops import rearrange, repeat, reduce, pack, unpack
 from einops.layers.torch import Reduce, Rearrange
+
+# ein
+
+# b - batch
+# n - sequence
+# t - refinement steps
+# d - feature dimension
 
 # network related
 
@@ -39,7 +45,8 @@ class TinyRecursiveModel(Module):
         num_refinement_blocks = 3,   # T in paper
         num_latent_refinements = 6,  # n in paper - 1 output refinement per N latent refinements
         halt_loss_weight = 1.,
-        num_register_tokens = 0
+        num_register_tokens = 0,
+        recurrent_grad_depth = 1 # in TRM, they only have gradients through last step, but can increase this
     ):
         super().__init__()
         assert num_refinement_blocks > 1
@@ -62,7 +69,7 @@ class TinyRecursiveModel(Module):
         self.to_pred = nn.Linear(dim, num_tokens, bias = False)
 
         self.to_halt_pred = nn.Sequential(
-            Reduce('b n d -> b d', 'mean'),
+            Reduce('... n d -> ... d', 'mean'),
             nn.Linear(dim, 1, bias = False),
             Rearrange('... 1 -> ...')
         )
@@ -72,6 +79,12 @@ class TinyRecursiveModel(Module):
         # init
 
         nn.init.zeros_(self.to_halt_pred[1].weight)
+
+        # like urm
+
+        assert 1 <= recurrent_grad_depth <= self.num_refinement_blocks
+
+        self.recurrent_grad_depth = recurrent_grad_depth
 
     @property
     def device(self):
@@ -122,19 +135,22 @@ class TinyRecursiveModel(Module):
         inputs,    # (b n d)
         outputs,   # (b n d)
         latents,   # (b n d)
-    ):
+    ):             # (t b n d), (b n d)
+
+        all_outputs = []
 
         for step in range_from_one(self.num_refinement_blocks):
 
-            # only last round of refinement receives gradients
+            is_recurrent_grad_step = step > (self.num_refinement_blocks - self.recurrent_grad_depth)
 
-            is_last = step == self.num_refinement_blocks
-            context = torch.no_grad if not is_last else nullcontext
+            outputs, latents = self.refine_latent_then_output_once(inputs, outputs, latents)
 
-            with context():
-                outputs, latents = self.refine_latent_then_output_once(inputs, outputs, latents)
+            all_outputs.append(outputs)
 
-        return outputs, latents
+            if not is_recurrent_grad_step:
+                outputs, latents = tuple(t.detach() for t in (outputs, latents))
+
+        return stack(all_outputs), latents
 
     @torch.no_grad()
     def predict(
@@ -162,7 +178,9 @@ class TinyRecursiveModel(Module):
         for step in range_from_one(max_deep_refinement_steps):
             is_last = step == max_deep_refinement_steps
 
-            outputs, latents = self.deep_refinement(inputs, outputs, latents)
+            all_outputs, latents = self.deep_refinement(inputs, outputs, latents)
+
+            outputs = all_outputs[-1] # use last refinement step output for prediction
 
             halt_prob = self.to_halt_pred(outputs).sigmoid()
 
@@ -219,31 +237,40 @@ class TinyRecursiveModel(Module):
 
         inputs, packed_shape = self.embed_inputs_with_registers(seq)
 
-        outputs, latents = self.deep_refinement(inputs, outputs, latents)
+        all_outputs, latents = self.deep_refinement(inputs, outputs, latents)
 
-        registers, outputs_for_pred = unpack(outputs, packed_shape, 'b * d')
+        registers, outputs_for_pred = unpack(all_outputs, packed_shape, 't b * d')
 
-        pred = self.to_pred(outputs_for_pred)
+        pred = self.to_pred(outputs_for_pred) # prediction now across all refinement steps
 
-        halt_logits = self.to_halt_pred(outputs)
+        halt_logits = self.to_halt_pred(all_outputs)
 
-        halt_prob = halt_logits.sigmoid()
+        last_outputs, last_pred = all_outputs[-1], pred[-1]
 
-        outputs, latents = outputs.detach(), latents.detach()
+        halt_prob = halt_logits[-1].sigmoid()
 
-        return_package = (outputs, latents, pred, halt_prob)
+        outputs, latents = last_outputs.detach(), latents.detach()
+
+        return_package = (outputs, latents, last_pred, halt_prob)
 
         if not exists(labels):
             return return_package
 
         # calculate loss if labels passed in
 
-        loss = F.cross_entropy(rearrange(pred, 'b n l -> b l n'), labels, reduction = 'none')
+        loss = F.cross_entropy(
+            rearrange(pred, 't b n l -> b l n t'),
+            repeat(labels, 'b n -> b n t', t = self.num_refinement_blocks),
+            reduction = 'none'
+        )
+
         loss = reduce(loss, 'b ... -> b', 'mean')
 
         is_all_correct = (pred.argmax(dim = -1) == labels).all(dim = -1)
 
         halt_loss = F.binary_cross_entropy_with_logits(halt_logits, is_all_correct.float(), reduction = 'none')
+
+        halt_loss = reduce(halt_loss, 't b -> b', 'mean')
 
         # total loss and loss breakdown
 
