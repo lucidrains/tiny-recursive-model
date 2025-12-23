@@ -3,16 +3,22 @@ param = pytest.mark.parametrize
 
 import torch
 
-from tiny_recursive_model.trm import TinyRecursiveModel
 from tiny_recursive_model.trainer import Trainer
 
 @param('use_self_attn', (False, True))
+@param('dense_loss', (False, True))
 @param('registers', (0, 4))
 def test_trm(
     use_self_attn,
+    dense_loss,
     registers
 ):
     from torch.optim import AdamW
+
+    if dense_loss:
+        from tiny_recursive_model.trm import TinyRecursiveModel
+    else:
+        from tiny_recursive_model.trm_dense_loss import TinyRecursiveModel
 
     if use_self_attn:
         from x_transformers import Encoder
@@ -44,9 +50,17 @@ def test_trm(
 
     pred_answer, exit_indices = trm.predict(seq)
 
-def test_trainer():
+@param('dense_loss', (False, True))
+def test_trainer(
+    dense_loss
+):
     from torch.utils.data import Dataset
     from tiny_recursive_model.mlp_mixer_1d import MLPMixer1D
+
+    if dense_loss:
+        from tiny_recursive_model.trm import TinyRecursiveModel
+    else:
+        from tiny_recursive_model.trm_dense_loss import TinyRecursiveModel
 
     trm = TinyRecursiveModel(
         dim = 16,
@@ -82,6 +96,7 @@ def test_trainer():
 def test_gpt():
     from torch.utils.data import Dataset
     from x_transformers import Decoder
+    from tiny_recursive_model.trm import TinyRecursiveModel
 
     trm = TinyRecursiveModel(
         dim = 16,

@@ -1,6 +1,6 @@
 [project]
 name = "tiny-recursive-model"
-version = "0.0.14"
+version = "0.0.15"
 description = "Tiny Recursive Model"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
